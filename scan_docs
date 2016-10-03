@@ -1,0 +1,203 @@
+#!/usr/bin/perl
+# This will require Date::Parse from CPAN (I think File::Path is in core.  I
+# know POSIX is.)
+# It also requires tesseract, and imagemagick (for display and convert).
+
+use strict;
+use warnings;
+
+use POSIX qw( strftime );
+use File::Path qw( make_path );
+use Date::Parse qw( str2time );
+
+# The top level dir where all scanned docs will go.
+my $dest_dir = '/home/jwheeler/scanned_docs';
+
+my %patterns = (
+    scotia_us => {
+        # Subdir is unnecessary if it's the same as the hash key above; this
+        # is just here to show it's possible.
+        subdir   => 'scotia_us',
+        # The pattern it should look for in the OCR'd text to figure out what
+        # kind of file it is.
+        pattern  => qr/US Dollar Daily/,
+        # A description just used to tell you what it's found.
+        desc     => 'Scotia US Dollar statement',
+        # The sub to call to decide on the filename to give to the resulting
+        # file.  (You can see the examples I've left in below.)
+        filename => sub { get_scotia_closing( shift ) },
+    },
+);
+
+# If I spent more time on this (which I still probably will), I'll actually
+# check the USB IDs and see where the system out it.  For now, I can depend on
+# it being /dev/sdb1.
+if ( !-e '/dev/sdb1' ) {
+    die "No doxie found (/dev/sdb1 doesn't exist).\n";
+}
+
+warn "Found Doxie.\n";
+
+my $mtab = do { local $/; open my $fh, '<', '/etc/mtab'; <$fh> };
+
+if ( $mtab =~ m{^/dev/sdb} ) {
+    die "Doxie is mounted.  Exiting.\n";
+}
+
+my $is_scanning = 0;
+my $has_scanned = 0;
+
+while ( 1 ) {
+    # Just a simple way of sleeping for less than 1 second, so we aren't in a
+    # busy loop eating CPU.
+    select( undef, undef, undef, .25 );
+
+    if ( $is_scanning ) {
+        if ( -e '/dev/sdb1' ) {
+            $is_scanning = 0;
+            $has_scanned = 1;
+        }
+    }
+    elsif ( !-e '/dev/sdb1' ) {
+        warn "Doxie appears to be scanning...\n";
+        $is_scanning = 1;
+        $has_scanned = 0;
+    }
+
+    next if !$has_scanned;
+
+    $has_scanned = 0;
+
+    warn "Mounting Doxie\n";
+    # Because I run this as a user, it's in my fstab with its mount path as
+    # /mnt/doxie and with the flag of 'user' so I can mount it as a user and
+    # not root.
+    system( '/bin/mount', '/dev/sdb1' );
+    warn "Looking for scanned files...\n";
+
+    my $did_files = 0;
+
+    foreach my $file ( </mnt/doxie/DCIM/100DOXIE/*.JPG> ) {
+        $did_files++;
+        # If you're using a multi-user system, this is a race condition and
+        # possible security hole.  I'm not, so I don't care.
+        system( '/usr/bin/convert', $file, '/tmp/scanned.pnm' );
+        my $output = `/usr/bin/tesseract /tmp/scanned.pnm stdout`;
+
+        if ( !$output ) {
+            warn "I can't find any text in ${file}'s output!\n";
+
+            # Idiocracy.
+            make_path( "$dest_dir/unscannable" );
+
+            my $fn = "$dest_dir/unscannable/" . time . '.jpg';
+
+            warn "Moving to $fn.\n";
+
+            system( '/bin/mv', $file, $fn );
+
+            next;
+        }
+
+        my $handled = 0;
+        my $filename;
+
+        foreach my $pattern ( keys %patterns ) {
+            my $info   = $patterns{ $pattern };
+            my $subdir = $patterns{ subdir } // $pattern;
+
+            next if $output !~ $info->{ pattern };
+
+            $handled++;
+
+            warn "Looks like a $info->{ desc }\n";
+
+            my $fn = $info->{ filename }->( $output );
+
+            make_path( "$dest_dir/$subdir" );
+
+            $fn //= time;
+
+            $filename = "$dest_dir/$subdir/$fn.jpg";
+
+            last;
+        }
+        
+        if ( !$handled ) {
+            warn "I don't know what this document is.\n";
+
+            my $pid = fork();
+
+            die "Can't fork: $!\n" if !defined $pid || $pid == -1;
+
+            exec( '/usr/bin/display', $file ) if $pid == 0;
+
+            print STDERR "Enter subdir to put this file in: ";
+            chomp( my $dir = <> );
+            make_path( "$dest_dir/$dir" );
+            print STDERR "Enter filename to give it: ";
+            chomp( my $fn = <> );
+
+            $filename = "$dest_dir/$dir/$fn";
+        }
+
+        warn "Moving file to '$filename'\n";
+        system( '/bin/mv', $file, $filename );
+    }
+
+    warn "No files!\n" if !$did_files;
+    warn "Unmounting doxie.\n";
+
+    system( '/bin/umount', '/mnt/doxie' );
+}
+
+sub get_scotia_closing {
+    my ( $text ) = @_;
+
+    my ( $date ) = $text =~ m{Closing Balance on (.+)\s+\$};
+
+    return $date
+        ? strftime( '%Y-%m-%d', localtime( str2time( $date ) ) )
+        : undef;
+}
+
+# Here, there's a 'page' parameter.  That's because the front and back of a
+# YNCU bank statement looks completely different.  So the regexes are
+# completely different between pages.  As such, the ->filename value in the
+# patterns hash looks like this:
+# yncu_page_1 => {
+#    subdir   => 'yncu',
+#    pattern  => qr/whatever/,
+#    filename => sub { get_yncu_filename( shift, 1 ) },
+# },
+# yncu_page_2 => {
+#    subdir   => 'yncu',
+#    pattern  => qr/whatever/,
+#    filename => sub { get_yncu_filename( shift, 2 ) },
+# },
+#
+# This is because they format the date the same between pages, so I can use
+# the same date finder method, but a different pattern.  I guess I could also
+# make it support an arrayref of patterns instead of pattern, and then use
+# that.. maybe I'll do that in a future iteration.
+sub get_yncu_filename {
+    my ( $text, $page ) = @_;
+
+    my ( $m, $d, $y ) = $text =~ m{^Date (\S+) \d+ to (\d+), (\d+)$};
+
+    return $m && $d && $y
+        ? strftime( '%Y-%m-%d', localtime( str2time( "$m $d, $y-$page" ) ) )
+        : undef;
+}
+
+sub get_hydro_one_fn {
+    my ( $text ) = @_;
+
+    my ( $page ) = $text =~ m{Page (\d+) of \d+};
+
+    my ( $date ) = $text =~ m{Billing date: (\S+\s+\d+,\s+\d+)};
+
+    return $page && $date
+        ? strftime( "%Y-%m-%d-$page", localtime( str2time( $date ) ) )
+        : undef;
+}
