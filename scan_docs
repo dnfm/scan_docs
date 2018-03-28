@@ -1,100 +1,191 @@
 #!/usr/bin/perl
-# This will require Date::Parse from CPAN (I think File::Path is in core.  I
-# know POSIX is.)
-# It also requires tesseract, and imagemagick (for display and convert).
+
+=head1 scan_docs
+
+A utility I wrote that handles scanned files created by my Brother ADS-1500W.
+
+You can modify it to work with any scanner that outputs files ImageMagick can
+read, but that will require at least modifying the regexes for matching its
+output files.
+
+The Brother scanner supports CIFS/Samba, so I have a share that it puts the
+files in.  This script is told to monitor that directory, and works
+accordingly.
+
+=head2 Usage
+
+Configure the documents you want it to support by following the comments and
+the examples in the included config file.
+
+Start the program by running:
+
+scan_docs <directory_to_watch> [config_file]
+
+If you don't specify config_file, it will look for scanner_config.yml in the
+same directory as the script itself.
+
+The program will then check the directory every 10 seconds for new scans.  If
+it finds one, it will convert it to pnm, run tesseract on it, and then parse
+the text so it (hopefully) knows what directory to put the file in.
+
+If the file is unscannable, it'll put it in unscannable/  If it is scannable,
+but doesn't match any configured documents, it will put it in
+other/<time>.pdf.
+
+I run this script from cron (it is safeguarded against more than one copy
+running at once), so I just put:
+
+* * * * * root scan_docs /docs
+
+In my crontab.  Then, when it successfully works on a file, it will do its
+thing, and exit, and I get an email of what happened so I can see if I need to
+take further action.
+
+(If you just want to run it all of the time and output it to a log file or
+something, you can remove the line that says 'exit;' below so it won't quit
+every time it successfully does any work.)
+
+Using this app and my brother scanner, my house has gone paperless.  I have
+scanned all of my documents, and this program categorised the vast majority
+for me, making it super duper easy.
+
+It also tries to be smart about monitoring files to make sure they've stopped
+changing size before it works on them (just in case the file is slow to copy
+or very large).
+
+Also, do not use this on a multi-user system without modification first -- it
+just scans to /tmp/scanned.pnm.  This is both a possible race-condition, as
+well as security vulnerability since there could be sensitive information in
+the file.
+
+Finally, if you want to write a subroutine to handle the filename generation
+for a document, define it between the {} containing 'ScanSubs' below, and
+follow the examples in the config file included.
+
+Patches/pull requests welcome.  Also, you could ask me nicely to make changes
+if anyone who isn't me decides to use this thing.
+
+=head2 Dependencies.
+
+Depends on the following perl modules:
+
+    * Fcntl
+    * YAML
+    * List::Util
+    * File::Path
+    * POSIX
+    * Date::Parse
+    * FindBin
+
+Also depends on the following apps:
+
+    * Tesseract
+    * ImageMagick
+
+=head2 Warranty/license/et al
+
+Program is licensed under the Perl Artistic license.  You can distribute it
+under the same terms as Perl itself.
+
+Program has no warranty.  Make sure it does what you want before you shred
+your documents.
+
+=cut
 
 use strict;
 use warnings;
 
-use POSIX qw( strftime );
-use File::Path qw( make_path );
-use Date::Parse qw( str2time );
+use Fcntl       qw( :flock    );
+use YAML        qw( LoadFile  );
+use List::Util  qw( any sum   );
+use File::Path  qw( make_path );
+use POSIX       qw( strftime  );
+use Date::Parse qw( str2time  );
+use FindBin     qw( $Bin      );
 
-# The top level dir where all scanned docs will go.
-my $dest_dir = '/home/jwheeler/scanned_docs';
+exit if !flock( DATA, LOCK_EX|LOCK_NB );
 
-my %patterns = (
-    scotia_us => {
-        # Subdir is unnecessary if it's the same as the hash key above; this
-        # is just here to show it's possible.
-        subdir   => 'scotia_us',
-        # The pattern it should look for in the OCR'd text to figure out what
-        # kind of file it is.
-        pattern  => qr/US Dollar Daily/,
-        # A description just used to tell you what it's found.
-        desc     => 'Scotia US Dollar statement',
-        # The sub to call to decide on the filename to give to the resulting
-        # file.  (You can see the examples I've left in below.)
-        filename => sub { get_scotia_closing( shift ) },
-    },
-);
+my $CONVERT   = '/usr/bin/convert';
+my $TESSERACT = '/usr/bin/tesseract';
 
-# If I spent more time on this (which I still probably will), I'll actually
-# check the USB IDs and see where the system out it.  For now, I can depend on
-# it being /dev/sdb1.
-if ( !-e '/dev/sdb1' ) {
-    die "No doxie found (/dev/sdb1 doesn't exist).\n";
+die "Usage: $0 <dir_to_watch> [config_file]\n" if !$ARGV[0]
+                                               ||  $ARGV[0] =~ m{^--?h(?:elp)};
+
+die "I can't run Tesseract ($TESSERACT)!\n" if !-x $TESSERACT;
+die "I can't run convert ($CONVERT)!\n"     if !-x $CONVERT;
+
+my $config_file = $ARGV[1] // "$Bin/scanner_config.yml";
+my $dest_dir    = $ARGV[0];
+
+die "I can't read my config file ($config_file)!\n"
+    if !-r $config_file || !-s _;
+
+my %files;
+my %skip;
+
+my $debug = 0;
+
+sub all_pages {
+    my ( $fn ) = @_;
+
+    my @return = ( $fn );
+
+    $fn =~ s/[.]jpg$//;
+
+    push @return, map { $_->[1] }
+                 sort { $a->[0] <=> $b->[0] }
+                  map { [ ( m{_\d+_(\d+)} ), $_ ] }
+                      <${fn}_*.jpg>;
+
+    return @return;
 }
 
-warn "Found Doxie.\n";
-
-my $mtab = do { local $/; open my $fh, '<', '/etc/mtab'; <$fh> };
-
-if ( $mtab =~ m{^/dev/sdb} ) {
-    die "Doxie is mounted.  Exiting.\n";
-}
-
-my $is_scanning = 0;
-my $has_scanned = 0;
+warn "$0 starting.\n" if $debug;
 
 while ( 1 ) {
-    # Just a simple way of sleeping for less than 1 second, so we aren't in a
-    # busy loop eating CPU.
-    select( undef, undef, undef, .25 );
-
-    if ( $is_scanning ) {
-        if ( -e '/dev/sdb1' ) {
-            $is_scanning = 0;
-            $has_scanned = 1;
-        }
-    }
-    elsif ( !-e '/dev/sdb1' ) {
-        warn "Doxie appears to be scanning...\n";
-        $is_scanning = 1;
-        $has_scanned = 0;
-    }
-
-    next if !$has_scanned;
-
-    $has_scanned = 0;
-
-    warn "Mounting Doxie\n";
-    # Because I run this as a user, it's in my fstab with its mount path as
-    # /mnt/doxie and with the flag of 'user' so I can mount it as a user and
-    # not root.
-    system( '/bin/mount', '/dev/sdb1' );
-    warn "Looking for scanned files...\n";
+    warn "Looking for new scans.\n" if $debug;
 
     my $did_files = 0;
 
-    foreach my $file ( </mnt/doxie/DCIM/100DOXIE/*.JPG> ) {
+    FILE:
+    foreach my $file ( <$dest_dir/*.jpg>) {
+        next FILE if $skip{ $file } || !-e $file;
+
+        my @all_files = all_pages( $file );
+        my $size_sum  = sum map { -s $_ } @all_files;
+
+        if ( !exists $files{ $file } || $files{ $file } != $size_sum ) {
+            $files{ $file } = $size_sum;
+            next FILE;
+        }
+
+        delete $files{ $file };
+
+        if ( $file =~ m{_\d+_\d+[.]jpg$} ) {
+            warn "This is: $file  Skipping." if $debug;
+
+            next FILE;
+        }
+
         $did_files++;
-        # If you're using a multi-user system, this is a race condition and
-        # possible security hole.  I'm not, so I don't care.
-        system( '/usr/bin/convert', $file, '/tmp/scanned.pnm' );
-        my $output = `/usr/bin/tesseract /tmp/scanned.pnm stdout`;
 
+        system( $CONVERT, $file, '/tmp/scanned.pnm' );
+        my $output = `$TESSERACT /tmp/scanned.pnm stdout 2> /dev/null`;
+        unlink '/tmp/scanned.pnm';
+
+        warn "Output: $output\n" if $debug;
+
+        # https://media.giphy.com/media/VtjMOYnPY93l6/giphy.gif
         if ( !$output ) {
-            warn "I can't find any text in ${file}'s output!\n";
+            warn "I can't find any text in ${file}'s output!\n" if $debug;
 
-            # Idiocracy.
             make_path( "$dest_dir/unscannable" );
 
-            my $fn = "$dest_dir/unscannable/" . time . '.jpg';
+            my $fn = "$dest_dir/unscannable/" . time . '.pdf';
 
             warn "Moving to $fn.\n";
 
-            system( '/bin/mv', $file, $fn );
+            system( $CONVERT, @all_files, $fn );
 
             next;
         }
@@ -102,102 +193,102 @@ while ( 1 ) {
         my $handled = 0;
         my $filename;
 
-        foreach my $pattern ( keys %patterns ) {
-            my $info   = $patterns{ $pattern };
-            my $subdir = $patterns{ subdir } // $pattern;
+        my $patterns = LoadFile( $config_file );
 
-            next if $output !~ $info->{ pattern };
+        warn "Loaded " . scalar( keys %{ $patterns } ) . " patterns."
+            if $debug;
+
+        foreach my $pattern ( keys %{ $patterns } ) {
+            my $info   = $patterns->{ $pattern };
+            my $subdir = $info->{ subdir } // $pattern;
+
+            my @patterns
+                = ref $info->{ pattern } && ref( $info->{ pattern } ) eq 'ARRAY'
+                    ? @{ $info->{ pattern } }
+                    :  ( $info->{ pattern } );
+
+            next if !any { $output =~ $_ }
+                     map { $_ = eval $_; die $@ if $@; $_ }
+                         @patterns;
+
+            die $@ if $@;
 
             $handled++;
 
-            warn "Looks like a $info->{ desc }\n";
+            warn "Looks like a $info->{ desc }\n" if $debug;
 
-            my $fn = $info->{ filename }->( $output );
+            warn "Sub: sub { ScanSubs::$info->{ filename } }\n"
+                if $debug;
+
+            my $sub = $info->{ filename }
+                ? eval "sub { ScanSubs::$info->{ filename } }"
+                : sub { with_regex( shift, $info->{ date_regex } ) };
+
+            die $@ if $@;
+
+            my $fn  = $sub->( $output );
 
             make_path( "$dest_dir/$subdir" );
 
             $fn //= time;
 
-            $filename = "$dest_dir/$subdir/$fn.jpg";
+            $filename = "$dest_dir/$subdir/$fn.pdf";
+
+            my $index = 1;
+            while ( -e $filename ) {
+                $filename = "$dest_dir/$subdir/$fn-$index.pdf";
+
+                $index++;
+            }
 
             last;
         }
-        
+
         if ( !$handled ) {
-            warn "I don't know what this document is.\n";
-
-            my $pid = fork();
-
-            die "Can't fork: $!\n" if !defined $pid || $pid == -1;
-
-            exec( '/usr/bin/display', $file ) if $pid == 0;
-
-            print STDERR "Enter subdir to put this file in: ";
-            chomp( my $dir = <> );
-            make_path( "$dest_dir/$dir" );
-            print STDERR "Enter filename to give it: ";
-            chomp( my $fn = <> );
-
-            $filename = "$dest_dir/$dir/$fn";
+            warn "I don't know what to do with $file.\n";
+            $filename = "$dest_dir/other/" . time . ".pdf";
         }
 
         warn "Moving file to '$filename'\n";
-        system( '/bin/mv', $file, $filename );
+
+        my @files = all_pages( $file );
+        my $ret   = system( $CONVERT, @files, $filename );
+
+        unlink @files if $ret == 0;
+
+        exit;
     }
 
-    warn "No files!\n" if !$did_files;
-    warn "Unmounting doxie.\n";
-
-    system( '/bin/umount', '/mnt/doxie' );
+    sleep 10;
 }
 
-sub get_scotia_closing {
-    my ( $text ) = @_;
+sub with_regex {
+    my ( $text, $regex ) = @_;
 
-    my ( $date ) = $text =~ m{Closing Balance on (.+)\s+\$};
+    $regex = eval $regex;
+
+    die $@ if $@;
+
+    my ( $date ) = $text =~ $regex;
 
     return $date
         ? strftime( '%Y-%m-%d', localtime( str2time( $date ) ) )
         : undef;
 }
 
-# Here, there's a 'page' parameter.  That's because the front and back of a
-# YNCU bank statement looks completely different.  So the regexes are
-# completely different between pages.  As such, the ->filename value in the
-# patterns hash looks like this:
-# yncu_page_1 => {
-#    subdir   => 'yncu',
-#    pattern  => qr/whatever/,
-#    filename => sub { get_yncu_filename( shift, 1 ) },
-# },
-# yncu_page_2 => {
-#    subdir   => 'yncu',
-#    pattern  => qr/whatever/,
-#    filename => sub { get_yncu_filename( shift, 2 ) },
-# },
-#
-# This is because they format the date the same between pages, so I can use
-# the same date finder method, but a different pattern.  I guess I could also
-# make it support an arrayref of patterns instead of pattern, and then use
-# that.. maybe I'll do that in a future iteration.
-sub get_yncu_filename {
-    my ( $text, $page ) = @_;
+{
+    package ScanSubs;
 
-    my ( $m, $d, $y ) = $text =~ m{^Date (\S+) \d+ to (\d+), (\d+)$};
+    sub get_mc_date {
+        my ( $text ) = @_;
 
-    return $m && $d && $y
-        ? strftime( '%Y-%m-%d', localtime( str2time( "$m $d, $y-$page" ) ) )
-        : undef;
+        my ( $date ) = $text =~ m{ISSUE.*DATE.*([a-z]{3}\s+\d+.?\s+\d+)}i;
+
+        return $date
+            ? strftime( "%Y-%m-%d", localtime( str2time( $date ) ) )
+            : undef;
+    }
 }
 
-sub get_hydro_one_fn {
-    my ( $text ) = @_;
-
-    my ( $page ) = $text =~ m{Page (\d+) of \d+};
-
-    my ( $date ) = $text =~ m{Billing date: (\S+\s+\d+,\s+\d+)};
-
-    return $page && $date
-        ? strftime( "%Y-%m-%d-$page", localtime( str2time( $date ) ) )
-        : undef;
-}
+__DATA__
+This is here to lock.  Nothing more.
