@@ -1,0 +1,92 @@
+scan_docs
+
+A utility I wrote that handles scanned files created by my Brother
+ADS-1500W.
+
+You can modify it to work with any scanner that outputs files
+ImageMagick can read, but that will require at least modifying the
+regexes for matching its output files.
+
+The Brother scanner supports CIFS/Samba, so I have a share that it
+puts the files in.  This script is told to monitor that directory,
+and works accordingly.
+
+USAGE:
+
+Configure the documents you want it to support by following the
+comments and the examples in the included config file.
+
+Start the program by running:
+
+scan_docs <directory_to_watch> [config_file]
+
+If you don't specify config_file, it will look for scanner_config.yml
+in the same directory as the script itself.
+
+The program will then check the directory every 10 seconds for new
+scans.  If it finds one, it will convert it to pnm, run tesseract on
+it, and then parse the text so it (hopefully) knows what directory to
+put the file in.
+
+If the file is unscannable, it'll put it in unscannable/  If it is
+scannable, but doesn't match any configured documents, it will put it
+in other/<time>.pdf.
+
+I run this script from cron (it is safeguarded against more than one
+copy running at once), so I just put:
+
+* * * * * root scan_docs /docs
+
+In my crontab.  Then, when it successfully works on a file, it will
+do its thing, and exit, and I get an email of what happened so I can
+see if I need to take further action.
+
+(If you just want to run it all of the time and output it to a log
+file or something, you can remove the line that says 'exit;' below so
+it won't quit every time it successfully does any work.)
+
+Using this app and my brother scanner, my house has gone paperless.
+I have scanned all of my documents, and this program categorised the
+vast majority for me, making it super duper easy.
+
+It also tries to be smart about monitoring files to make sure they've
+stopped changing size before it works on them (just in case the file
+is slow to copy or very large).
+
+Also, do not use this on a multi-user system without modification
+first -- it just scans to /tmp/scanned.pnm.  This is both a possible
+race-condition, as well as security vulnerability since there could
+be sensitive information in the file.
+
+Finally, if you want to write a subroutine to handle the filename
+generation for a document, define it between the {} containing
+'ScanSubs' below, and follow the examples in the config file
+included.
+
+Patches/pull requests welcome.  Also, you could ask me nicely to make
+changes if anyone who isn't me decides to use this thing.
+
+DEPENDENCIES
+
+Depends on the following perl modules:
+
+    * Fcntl
+    * YAML
+    * List::Util
+    * File::Path
+    * POSIX
+    * Date::Parse
+    * FindBin
+
+Also depends on the following apps:
+
+    * Tesseract
+    * ImageMagick
+
+WARRANTY/LICENSE
+
+Program is licensed under the Perl Artistic license.  You can
+distribute it under the same terms as Perl itself.
+
+Program has no warranty.  Make sure it does what you want before you
+shred your documents.
